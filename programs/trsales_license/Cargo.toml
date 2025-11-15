@@ -1,5 +1,5 @@
 [package]
-name = "trsaleslicense"
+name = "trsales_license"
 version = "0.1.0"
 description = "TRSales License referral rewards program"
 edition = "2021"
