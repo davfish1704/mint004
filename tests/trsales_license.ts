@@ -121,6 +121,7 @@ describe("trsales_license", () => {
         payer: user.publicKey,
         profile: profilePda,
         rewardVault,
+        usdcMint,
         rewardUsdc,
         user: user.publicKey,
         systemProgram: SystemProgram.programId,

@@ -16,5 +16,5 @@ no-idl = []
 no-log-ix-name = []
 
 [dependencies]
-anchor-lang = "0.29.0"
+anchor-lang = { version = "0.29.0", features = ["init-if-needed"] }
 anchor-spl = "0.29.0"
