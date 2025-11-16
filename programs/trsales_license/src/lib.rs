@@ -1,7 +1,9 @@
+use anchor_lang::context::Context as ProgramContext;
 use anchor_lang::prelude::*;
-use anchor_lang::prelude::{AccountDeserialize, AccountSerialize};
-use anchor_lang::system_program;
-use anchor_spl::associated_token::{get_associated_token_address, AssociatedToken};
+use anchor_lang::solana_program::{
+    program::{invoke, invoke_signed},
+    system_instruction,
+};
 use anchor_spl::token::{self, Mint, MintTo, Token, TokenAccount, Transfer};
 
 pub const CONFIG_SEED: &[u8] = b"config";
@@ -9,43 +11,28 @@ pub const PROFILE_SEED: &[u8] = b"profile";
 pub const REWARD_SEED: &[u8] = b"reward";
 pub const ORDER_SEED: &[u8] = b"order";
 
-const MAX_REFERRAL_DEPTH: usize = 3;
-const BASIS_POINTS: u64 = 10_000;
-const REFERRAL_BPS: [u64; MAX_REFERRAL_DEPTH] = [5_000, 3_000, 2_000];
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct InitializeArgs {
+    pub admin: Pubkey,
+    pub usdc_mint: Pubkey,
+    pub collection_mint: Pubkey,
+    pub sol_price: u64,
+    pub usdc_price: u64,
+}
 
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+declare_id!("Trsa1esReferr4l1ju8GhhQXUfdViQspuWqX9u9KQk8k");
 
 #[program]
 pub mod trsales_license {
     use super::*;
-    use std::convert::TryInto;
 
     pub fn initialize(ctx: Context<Initialize>, args: InitializeArgs) -> Result<()> {
-        require!(!args.admin.eq(&Pubkey::default()), ErrorCode::InvalidAdmin);
-        require!(args.sol_price > 0, ErrorCode::InvalidPrice);
-        require!(args.usdc_price > 0, ErrorCode::InvalidPrice);
-        require_keys_eq!(
-            args.collection_mint,
-            ctx.accounts.collection_mint.key(),
-            ErrorCode::InvalidCollectionMint
-        );
-        require_keys_eq!(
-            ctx.accounts.treasury_usdc.mint,
-            args.usdc_mint,
-            ErrorCode::InvalidTreasuryAccount
-        );
-        require_keys_eq!(
-            ctx.accounts.treasury_usdc.owner,
-            args.admin,
-            ErrorCode::InvalidTreasuryAccount
-        );
-
         let config = &mut ctx.accounts.config;
         config.admin = args.admin;
+        config.usdc_mint = args.usdc_mint;
+        config.collection_mint = args.collection_mint;
         config.treasury_sol = ctx.accounts.treasury_sol.key();
         config.treasury_usdc = ctx.accounts.treasury_usdc.key();
-        config.collection_mint = ctx.accounts.collection_mint.key();
-        config.usdc_mint = args.usdc_mint;
         config.sol_price = args.sol_price;
         config.usdc_price = args.usdc_price;
         config.bump = ctx.bumps.config;
@@ -59,6 +46,7 @@ pub mod trsales_license {
         profile.has_referrer = false;
         profile.referrer = Pubkey::default();
         profile.bump = ctx.bumps.profile;
+        profile.minted_nft = false;
 
         let reward_vault = &mut ctx.accounts.reward_vault;
         reward_vault.user = ctx.accounts.user.key();
@@ -70,13 +58,17 @@ pub mod trsales_license {
     }
 
     pub fn set_referrer(ctx: Context<SetReferrer>, parent: Pubkey) -> Result<()> {
-        require_keys_neq!(ctx.accounts.user.key(), parent, ErrorCode::InvalidReferrer);
-
         let profile = &mut ctx.accounts.profile;
-        require!(!profile.has_referrer, ErrorCode::ReferrerAlreadySet);
-
-        let parent_profile = &ctx.accounts.parent_profile;
-        require_keys_eq!(parent_profile.user, parent, ErrorCode::InvalidReferrer);
+        require!(
+            profile.user == ctx.accounts.user.key(),
+            TrsalesError::Unauthorized
+        );
+        require!(profile.user != parent, TrsalesError::SelfReferral);
+        require!(!profile.has_referrer, TrsalesError::ReferrerAlreadySet);
+        require!(
+            ctx.accounts.parent_profile.user == parent,
+            TrsalesError::InvalidReferrer
+        );
 
         profile.has_referrer = true;
         profile.referrer = parent;
@@ -85,369 +77,384 @@ pub mod trsales_license {
     }
 
     pub fn mint_with_sol<'info>(
-        ctx: Context<'_, '_, '_, 'info, MintWithSol<'info>>,
-        order_id: Vec<u8>,
+        ctx: ProgramContext<'_, '_, '_, 'info, MintWithSol<'info>>,
+        order_seed: Vec<u8>,
     ) -> Result<()> {
-        require!(order_id.len() == 16, ErrorCode::InvalidOrderId);
-
-        require!(!ctx.accounts.order.used, ErrorCode::OrderAlreadyUsed);
-
-        let buyer_key = ctx.accounts.buyer.key();
-
+        require_eq!(order_seed.len(), 16, TrsalesError::InvalidOrderSeed);
+        let config = &ctx.accounts.config;
+        require_keys_eq!(
+            ctx.accounts.treasury_sol.key(),
+            config.treasury_sol,
+            TrsalesError::InvalidTreasury
+        );
+        require_keys_eq!(
+            ctx.accounts.collection_mint.key(),
+            config.collection_mint,
+            TrsalesError::CollectionMismatch
+        );
         require_keys_eq!(
             ctx.accounts.buyer_profile.user,
-            buyer_key,
-            ErrorCode::ProfileMismatch
+            ctx.accounts.buyer.key(),
+            TrsalesError::Unauthorized
         );
-
         require_keys_eq!(
             ctx.accounts.buyer_reward_vault.user,
-            buyer_key,
-            ErrorCode::ProfileMismatch
+            ctx.accounts.buyer.key(),
+            TrsalesError::Unauthorized
         );
 
-        let starting_referrer = if ctx.accounts.buyer_profile.has_referrer {
-            Some(ctx.accounts.buyer_profile.referrer)
-        } else {
-            None
-        };
-        let sol_price = ctx.accounts.config.sol_price;
-        let mut distributed: u64 = 0;
-        let buyer_info = ctx.accounts.buyer.to_account_info();
-        let system_program_info = ctx.accounts.system_program.to_account_info();
-        let treasury_sol_info = ctx.accounts.treasury_sol.to_account_info();
+        let order = &mut ctx.accounts.order;
+        order.id = order_seed
+            .clone()
+            .try_into()
+            .map_err(|_| TrsalesError::InvalidOrderSeed)?;
+        order.bump = ctx.bumps.order;
 
-        let mut used_accounts = 0;
-        let mut expected_referrer = starting_referrer;
-
-        for depth in 0..MAX_REFERRAL_DEPTH {
-            let Some(referrer) = expected_referrer else {
-                break;
-            };
-
-            let start = used_accounts;
-            let end = start + 4;
-            if end > ctx.remaining_accounts.len() {
-                return err!(ErrorCode::MissingReferralAccounts);
-            }
-
-            let (node, next_referrer) = validate_referral(
-                ctx.program_id,
-                &ctx.accounts.collection_mint.key(),
-                &ctx.accounts.config.usdc_mint,
-                referrer,
-                ctx.remaining_accounts[start].clone(),
-                ctx.remaining_accounts[start + 1].clone(),
-                ctx.remaining_accounts[start + 2].clone(),
-                &ctx.remaining_accounts[start + 3],
-            )?;
-
-            used_accounts = end;
-            expected_referrer = next_referrer;
-
-            let ReferralNode {
-                reward_vault_info,
-                reward_usdc_info: _,
-                reward_vault,
-            } = node;
-
-            let share = sol_price
-                .checked_mul(REFERRAL_BPS[depth])
-                .ok_or(ErrorCode::MathOverflow)?
-                .checked_div(BASIS_POINTS)
-                .ok_or(ErrorCode::MathOverflow)?;
-            if share == 0 {
-                continue;
-            }
-
-            system_program::transfer(
-                CpiContext::new(
-                    system_program_info.clone(),
-                    system_program::Transfer {
-                        from: buyer_info.clone(),
-                        to: reward_vault_info.clone(),
-                    },
-                ),
-                share,
-            )?;
-
-            let mut updated_vault = reward_vault;
-            updated_vault.claimable_sol = updated_vault
-                .claimable_sol
-                .checked_add(share)
-                .ok_or(ErrorCode::MathOverflow)?;
-            distributed = distributed
-                .checked_add(share)
-                .ok_or(ErrorCode::MathOverflow)?;
-
-            {
-                let mut data = reward_vault_info.try_borrow_mut_data()?;
-                let mut slice: &mut [u8] = &mut data;
-                updated_vault.try_serialize(&mut slice)?;
-            }
-        }
-
-        if used_accounts != ctx.remaining_accounts.len() {
-            return err!(ErrorCode::TooManyReferralAccounts);
-        }
-
-        let remaining = sol_price
-            .checked_sub(distributed)
-            .ok_or(ErrorCode::MathOverflow)?;
-
-        if remaining > 0 {
-            system_program::transfer(
-                CpiContext::new(
-                    system_program_info,
-                    system_program::Transfer {
-                        from: buyer_info,
-                        to: treasury_sol_info,
-                    },
-                ),
-                remaining,
-            )?;
-        }
-
-        mint_collection_nft(
-            ctx.accounts.config.bump,
-            ctx.accounts.collection_mint.to_account_info(),
-            ctx.accounts.buyer_nft_account.to_account_info(),
-            ctx.accounts.config.to_account_info(),
-            ctx.accounts.token_program.to_account_info(),
+        distribute_sol(
+            ctx.accounts.buyer.as_ref(),
+            ctx.accounts.treasury_sol.as_ref(),
+            ctx.accounts.system_program.as_ref(),
+            ctx.remaining_accounts,
+            config.sol_price,
         )?;
 
-        let order = &mut ctx.accounts.order;
-        order.used = true;
-        order.seed = order_id
-            .as_slice()
-            .try_into()
-            .map_err(|_| ErrorCode::InvalidOrderId)?;
-        order.buyer = buyer_key;
-        order.bump =
-            Pubkey::find_program_address(&[ORDER_SEED, order.seed.as_ref()], ctx.program_id).1;
+        mint_collection_nft(
+            &ctx.accounts.config,
+            &ctx.accounts.collection_mint,
+            &ctx.accounts.buyer_nft_account,
+            &ctx.accounts.token_program,
+        )?;
+
+        ctx.accounts.buyer_profile.minted_nft = true;
 
         Ok(())
     }
 
     pub fn mint_with_usdc<'info>(
-        ctx: Context<'_, '_, '_, 'info, MintWithUsdc<'info>>,
-        order_id: Vec<u8>,
+        ctx: ProgramContext<'_, '_, '_, 'info, MintWithUsdc<'info>>,
+        order_seed: Vec<u8>,
     ) -> Result<()> {
-        require!(order_id.len() == 16, ErrorCode::InvalidOrderId);
-
-        require!(!ctx.accounts.order.used, ErrorCode::OrderAlreadyUsed);
-
-        let buyer_key = ctx.accounts.buyer.key();
+        require_eq!(order_seed.len(), 16, TrsalesError::InvalidOrderSeed);
+        let config = &ctx.accounts.config;
+        require_keys_eq!(
+            ctx.accounts.treasury_sol.key(),
+            config.treasury_sol,
+            TrsalesError::InvalidTreasury
+        );
+        require_keys_eq!(
+            ctx.accounts.treasury_usdc.mint,
+            config.usdc_mint,
+            TrsalesError::InvalidTreasury
+        );
+        require_keys_eq!(
+            ctx.accounts.collection_mint.key(),
+            config.collection_mint,
+            TrsalesError::CollectionMismatch
+        );
         require_keys_eq!(
             ctx.accounts.buyer_profile.user,
-            buyer_key,
-            ErrorCode::ProfileMismatch
+            ctx.accounts.buyer.key(),
+            TrsalesError::Unauthorized
         );
-
         require_keys_eq!(
             ctx.accounts.buyer_reward_vault.user,
-            buyer_key,
-            ErrorCode::ProfileMismatch
+            ctx.accounts.buyer.key(),
+            TrsalesError::Unauthorized
         );
 
-        let starting_referrer = if ctx.accounts.buyer_profile.has_referrer {
-            Some(ctx.accounts.buyer_profile.referrer)
-        } else {
-            None
-        };
-        let usdc_price = ctx.accounts.config.usdc_price;
-        let mut distributed: u64 = 0;
-        let buyer_info = ctx.accounts.buyer.to_account_info();
-        let buyer_usdc_info = ctx.accounts.buyer_usdc.to_account_info();
-        let token_program_info = ctx.accounts.token_program.to_account_info();
-        let treasury_usdc_info = ctx.accounts.treasury_usdc.to_account_info();
+        let order = &mut ctx.accounts.order;
+        order.id = order_seed
+            .clone()
+            .try_into()
+            .map_err(|_| TrsalesError::InvalidOrderSeed)?;
+        order.bump = ctx.bumps.order;
 
-        let mut used_accounts = 0;
-        let mut expected_referrer = starting_referrer;
-
-        for depth in 0..MAX_REFERRAL_DEPTH {
-            let Some(referrer) = expected_referrer else {
-                break;
-            };
-
-            let start = used_accounts;
-            let end = start + 4;
-            if end > ctx.remaining_accounts.len() {
-                return err!(ErrorCode::MissingReferralAccounts);
-            }
-
-            let (node, next_referrer) = validate_referral(
-                ctx.program_id,
-                &ctx.accounts.collection_mint.key(),
-                &ctx.accounts.config.usdc_mint,
-                referrer,
-                ctx.remaining_accounts[start].clone(),
-                ctx.remaining_accounts[start + 1].clone(),
-                ctx.remaining_accounts[start + 2].clone(),
-                &ctx.remaining_accounts[start + 3],
-            )?;
-
-            used_accounts = end;
-            expected_referrer = next_referrer;
-
-            let ReferralNode {
-                reward_vault_info,
-                reward_usdc_info,
-                reward_vault,
-            } = node;
-
-            let share = usdc_price
-                .checked_mul(REFERRAL_BPS[depth])
-                .ok_or(ErrorCode::MathOverflow)?
-                .checked_div(BASIS_POINTS)
-                .ok_or(ErrorCode::MathOverflow)?;
-            if share == 0 {
-                continue;
-            }
-
-            token::transfer(
-                CpiContext::new(
-                    token_program_info.clone(),
-                    Transfer {
-                        from: buyer_usdc_info.clone(),
-                        to: reward_usdc_info.clone(),
-                        authority: buyer_info.clone(),
-                    },
-                ),
-                share,
-            )?;
-
-            let mut updated_vault = reward_vault;
-            updated_vault.claimable_usdc = updated_vault
-                .claimable_usdc
-                .checked_add(share)
-                .ok_or(ErrorCode::MathOverflow)?;
-            distributed = distributed
-                .checked_add(share)
-                .ok_or(ErrorCode::MathOverflow)?;
-
-            {
-                let mut data = reward_vault_info.try_borrow_mut_data()?;
-                let mut slice: &mut [u8] = &mut data;
-                updated_vault.try_serialize(&mut slice)?;
-            }
-        }
-
-        if used_accounts != ctx.remaining_accounts.len() {
-            return err!(ErrorCode::TooManyReferralAccounts);
-        }
-
-        let remaining = usdc_price
-            .checked_sub(distributed)
-            .ok_or(ErrorCode::MathOverflow)?;
-        if remaining > 0 {
-            token::transfer(
-                CpiContext::new(
-                    token_program_info,
-                    Transfer {
-                        from: buyer_usdc_info,
-                        to: treasury_usdc_info,
-                        authority: buyer_info,
-                    },
-                ),
-                remaining,
-            )?;
-        }
-
-        mint_collection_nft(
-            ctx.accounts.config.bump,
-            ctx.accounts.collection_mint.to_account_info(),
-            ctx.accounts.buyer_nft_account.to_account_info(),
-            ctx.accounts.config.to_account_info(),
-            ctx.accounts.token_program.to_account_info(),
+        distribute_usdc(
+            ctx.accounts.buyer.as_ref(),
+            ctx.accounts.buyer_usdc.as_ref(),
+            ctx.accounts.treasury_usdc.as_ref(),
+            ctx.accounts.token_program.as_ref(),
+            ctx.remaining_accounts,
+            config.usdc_price,
         )?;
 
-        let order = &mut ctx.accounts.order;
-        order.used = true;
-        order.seed = order_id
-            .as_slice()
-            .try_into()
-            .map_err(|_| ErrorCode::InvalidOrderId)?;
-        order.buyer = buyer_key;
-        order.bump =
-            Pubkey::find_program_address(&[ORDER_SEED, order.seed.as_ref()], ctx.program_id).1;
+        mint_collection_nft(
+            &ctx.accounts.config,
+            &ctx.accounts.collection_mint,
+            &ctx.accounts.buyer_nft_account,
+            &ctx.accounts.token_program,
+        )?;
+
+        ctx.accounts.buyer_profile.minted_nft = true;
 
         Ok(())
     }
 
     pub fn claim_sol(ctx: Context<ClaimSol>) -> Result<()> {
-        let reward_vault = &mut ctx.accounts.reward_vault;
-        let amount = reward_vault.claimable_sol;
-        require!(amount > 0, ErrorCode::NothingToClaim);
-
-        let vault_info = reward_vault.to_account_info();
-        require!(
-            vault_info.lamports() >= amount,
-            ErrorCode::InsufficientVaultFunds
+        let amount = ctx.accounts.reward_vault.claimable_sol;
+        require!(amount > 0, TrsalesError::NothingToClaim);
+        require_keys_eq!(
+            ctx.accounts.reward_vault.user,
+            ctx.accounts.user.key(),
+            TrsalesError::Unauthorized
         );
 
-        **vault_info.try_borrow_mut_lamports()? -= amount;
-        **ctx
-            .accounts
-            .user
-            .to_account_info()
-            .try_borrow_mut_lamports()? += amount;
+        let bump = ctx.accounts.reward_vault.bump;
+        let signer_seeds: &[&[u8]] = &[REWARD_SEED, ctx.accounts.user.key.as_ref(), &[bump]];
+        let signer = &[signer_seeds];
 
-        reward_vault.claimable_sol = 0;
+        let ix = system_instruction::transfer(
+            &ctx.accounts.reward_vault.key(),
+            &ctx.accounts.user.key(),
+            amount,
+        );
+        invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.reward_vault.to_account_info(),
+                ctx.accounts.user.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            signer,
+        )?;
 
+        ctx.accounts.reward_vault.claimable_sol = 0;
         Ok(())
     }
 
     pub fn claim_usdc(ctx: Context<ClaimUsdc>) -> Result<()> {
-        let reward_vault = &mut ctx.accounts.reward_vault;
-        let amount = reward_vault.claimable_usdc;
-        require!(amount > 0, ErrorCode::NothingToClaim);
+        let amount = ctx.accounts.reward_vault.claimable_usdc;
+        require!(amount > 0, TrsalesError::NothingToClaim);
+        require_keys_eq!(
+            ctx.accounts.reward_vault.user,
+            ctx.accounts.user.key(),
+            TrsalesError::Unauthorized
+        );
 
-        let seeds = &[
-            REWARD_SEED,
-            reward_vault.user.as_ref(),
-            &[reward_vault.bump],
-        ];
-        let signer_seeds = &[&seeds[..]];
+        let bump = ctx.accounts.reward_vault.bump;
+        let signer_seeds: &[&[u8]] = &[REWARD_SEED, ctx.accounts.user.key.as_ref(), &[bump]];
+        let signer = &[signer_seeds];
 
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.reward_usdc.to_account_info(),
+            to: ctx.accounts.user_usdc.to_account_info(),
+            authority: ctx.accounts.reward_vault.to_account_info(),
+        };
         token::transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from: ctx.accounts.reward_usdc.to_account_info(),
-                    to: ctx.accounts.user_usdc.to_account_info(),
-                    authority: reward_vault.to_account_info(),
-                },
-                signer_seeds,
+                cpi_accounts,
+                signer,
             ),
             amount,
         )?;
 
-        reward_vault.claimable_usdc = 0;
-
+        ctx.accounts.reward_vault.claimable_usdc = 0;
         Ok(())
     }
 }
 
-fn mint_collection_nft<'info>(
-    config_bump: u8,
-    mint: AccountInfo<'info>,
-    destination: AccountInfo<'info>,
-    config_info: AccountInfo<'info>,
-    token_program: AccountInfo<'info>,
+fn distribute_sol<'info>(
+    buyer: &AccountInfo<'info>,
+    treasury_sol: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    remaining: &[AccountInfo<'info>],
+    price: u64,
 ) -> Result<()> {
-    let seeds = &[CONFIG_SEED, &[config_bump]];
-    let signer = &[&seeds[..]];
+    let mut distributed: u64 = 0;
+    let mut level = 0;
+
+    for chunk in remaining.chunks(4) {
+        if chunk.len() < 4 || level >= 3 {
+            break;
+        }
+        let profile_info = &chunk[0];
+        let reward_vault_info = &chunk[1];
+        validate_profile_owner(profile_info, reward_vault_info)?;
+
+        let percent = match level {
+            0 => 50,
+            1 => 30,
+            _ => 20,
+        };
+        let amount = price
+            .checked_mul(percent)
+            .and_then(|v| v.checked_div(100))
+            .ok_or(TrsalesError::MathOverflow)?;
+
+        let ix = system_instruction::transfer(&buyer.key, &reward_vault_info.key, amount);
+        invoke(
+            &ix,
+            &[
+                buyer.clone(),
+                reward_vault_info.clone(),
+                system_program.clone(),
+            ],
+        )?;
+
+        increment_reward_vault(reward_vault_info, amount, RewardField::Sol)?;
+        distributed = distributed
+            .checked_add(amount)
+            .ok_or(TrsalesError::MathOverflow)?;
+        level += 1;
+    }
+
+    let remainder = price
+        .checked_sub(distributed)
+        .ok_or(TrsalesError::MathOverflow)?;
+    if remainder > 0 {
+        let ix = system_instruction::transfer(&buyer.key, &treasury_sol.key, remainder);
+        invoke(
+            &ix,
+            &[buyer.clone(), treasury_sol.clone(), system_program.clone()],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn distribute_usdc<'info>(
+    buyer: &AccountInfo<'info>,
+    buyer_usdc: &AccountInfo<'info>,
+    treasury_usdc: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
+    remaining: &[AccountInfo<'info>],
+    price: u64,
+) -> Result<()> {
+    let mut distributed: u64 = 0;
+    let mut level = 0;
+
+    for chunk in remaining.chunks(4) {
+        if chunk.len() < 4 || level >= 3 {
+            break;
+        }
+        let profile_info = &chunk[0];
+        let reward_vault_info = &chunk[1];
+        let reward_usdc_info = &chunk[2];
+        validate_profile_owner(profile_info, reward_vault_info)?;
+
+        let percent = match level {
+            0 => 50,
+            1 => 30,
+            _ => 20,
+        };
+        let amount = price
+            .checked_mul(percent)
+            .and_then(|v| v.checked_div(100))
+            .ok_or(TrsalesError::MathOverflow)?;
+
+        let cpi_accounts = Transfer {
+            from: buyer_usdc.clone(),
+            to: reward_usdc_info.clone(),
+            authority: buyer.clone(),
+        };
+        token::transfer(CpiContext::new(token_program.clone(), cpi_accounts), amount)?;
+
+        increment_reward_vault(reward_vault_info, amount, RewardField::Usdc)?;
+        distributed = distributed
+            .checked_add(amount)
+            .ok_or(TrsalesError::MathOverflow)?;
+        level += 1;
+    }
+
+    let remainder = price
+        .checked_sub(distributed)
+        .ok_or(TrsalesError::MathOverflow)?;
+    if remainder > 0 {
+        let cpi_accounts = Transfer {
+            from: buyer_usdc.clone(),
+            to: treasury_usdc.clone(),
+            authority: buyer.clone(),
+        };
+        token::transfer(
+            CpiContext::new(token_program.clone(), cpi_accounts),
+            remainder,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_profile_owner(
+    profile_info: &AccountInfo,
+    reward_vault_info: &AccountInfo,
+) -> Result<()> {
+    require_keys_eq!(
+        *profile_info.owner,
+        crate::id(),
+        TrsalesError::InvalidProfileAccount
+    );
+    require_keys_eq!(
+        *reward_vault_info.owner,
+        crate::id(),
+        TrsalesError::InvalidRewardVault
+    );
+
+    let profile_user = {
+        let data = profile_info.try_borrow_data()?;
+        let mut slice: &[u8] = &data;
+        let profile = ReferralProfile::try_deserialize(&mut slice)?;
+        profile.user
+    };
+    let reward_user = {
+        let data = reward_vault_info.try_borrow_data()?;
+        let mut slice: &[u8] = &data;
+        let reward = RewardVault::try_deserialize(&mut slice)?;
+        reward.user
+    };
+
+    require_keys_eq!(profile_user, reward_user, TrsalesError::ProfileMismatch);
+    Ok(())
+}
+
+enum RewardField {
+    Sol,
+    Usdc,
+}
+
+fn increment_reward_vault(account: &AccountInfo, amount: u64, field: RewardField) -> Result<()> {
+    require_keys_eq!(
+        *account.owner,
+        crate::id(),
+        TrsalesError::InvalidRewardVault
+    );
+    let mut data = account.try_borrow_mut_data()?;
+    let mut slice: &[u8] = &data;
+    let mut reward = RewardVault::try_deserialize(&mut slice)?;
+    match field {
+        RewardField::Sol => {
+            reward.claimable_sol = reward
+                .claimable_sol
+                .checked_add(amount)
+                .ok_or(TrsalesError::MathOverflow)?;
+        }
+        RewardField::Usdc => {
+            reward.claimable_usdc = reward
+                .claimable_usdc
+                .checked_add(amount)
+                .ok_or(TrsalesError::MathOverflow)?;
+        }
+    }
+    let mut out_slice: &mut [u8] = &mut data;
+    reward.serialize(&mut out_slice)?;
+    Ok(())
+}
+
+fn mint_collection_nft<'info>(
+    config: &Account<'info, Config>,
+    mint: &Account<'info, Mint>,
+    destination: &Account<'info, TokenAccount>,
+    token_program: &Program<'info, Token>,
+) -> Result<()> {
+    let seeds: &[&[u8]] = &[CONFIG_SEED, &[config.bump]];
+    let signer = &[seeds];
+    let cpi_accounts = MintTo {
+        mint: mint.to_account_info(),
+        to: destination.to_account_info(),
+        authority: config.to_account_info(),
+    };
     token::mint_to(
-        CpiContext::new_with_signer(
-            token_program,
-            MintTo {
-                mint,
-                to: destination,
-                authority: config_info,
-            },
-            signer,
-        ),
+        CpiContext::new_with_signer(token_program.to_account_info(), cpi_accounts, signer),
         1,
     )
 }
@@ -464,155 +471,117 @@ pub struct Initialize<'info> {
     pub config: Account<'info, Config>,
     #[account(mut)]
     pub payer: Signer<'info>,
-    /// CHECK: stored as provided
-    #[account(mut)]
-    pub treasury_sol: AccountInfo<'info>,
-    #[account(mut)]
+    /// CHECK: stored in config
+    pub treasury_sol: UncheckedAccount<'info>,
     pub treasury_usdc: Account<'info, TokenAccount>,
     #[account(mut)]
     pub collection_mint: Account<'info, Mint>,
     pub system_program: Program<'info, System>,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct InitializeArgs {
-    pub admin: Pubkey,
-    pub usdc_mint: Pubkey,
-    pub collection_mint: Pubkey,
-    pub sol_price: u64,
-    pub usdc_price: u64,
-}
-
 #[derive(Accounts)]
 pub struct RegisterUser<'info> {
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
     #[account(mut)]
     pub payer: Signer<'info>,
     #[account(
         init,
         payer = payer,
-        space = ReferralProfile::LEN,
         seeds = [PROFILE_SEED, user.key().as_ref()],
-        bump
+        bump,
+        space = ReferralProfile::LEN
     )]
     pub profile: Account<'info, ReferralProfile>,
     #[account(
         init,
         payer = payer,
-        space = RewardVault::LEN,
         seeds = [REWARD_SEED, user.key().as_ref()],
-        bump
+        bump,
+        space = RewardVault::LEN
     )]
     pub reward_vault: Account<'info, RewardVault>,
-    #[account(address = config.usdc_mint)]
-    pub usdc_mint: Account<'info, Mint>,
-    #[account(
-        init_if_needed,
-        payer = payer,
-        associated_token::mint = usdc_mint,
-        associated_token::authority = reward_vault
-    )]
-    pub reward_usdc: Account<'info, TokenAccount>,
+    /// CHECK: Provided for compatibility with clients
+    #[account(mut)]
+    pub reward_usdc: UncheckedAccount<'info>,
     pub user: Signer<'info>,
     pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
 pub struct SetReferrer<'info> {
-    #[account(mut, seeds = [PROFILE_SEED, user.key().as_ref()], bump = profile.bump)]
+    #[account(mut, has_one = user)]
     pub profile: Account<'info, ReferralProfile>,
     pub user: Signer<'info>,
-    #[account(seeds = [PROFILE_SEED, parent_profile.user.as_ref()], bump = parent_profile.bump)]
     pub parent_profile: Account<'info, ReferralProfile>,
 }
 
 #[derive(Accounts)]
-#[instruction(order_id: Vec<u8>)]
+#[instruction(order_seed: Vec<u8>)]
 pub struct MintWithSol<'info> {
     #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
-    /// CHECK: validated via config
-    #[account(mut, address = config.treasury_sol)]
-    pub treasury_sol: AccountInfo<'info>,
+    /// CHECK: validated against config
+    #[account(mut)]
+    pub treasury_sol: UncheckedAccount<'info>,
     #[account(mut)]
     pub buyer: Signer<'info>,
     #[account(
-        init_if_needed,
+        init,
         payer = buyer,
-        space = Order::LEN,
-        seeds = [ORDER_SEED, order_id.as_slice()],
-        bump
+        seeds = [ORDER_SEED, order_seed.as_slice()],
+        bump,
+        space = Order::LEN
     )]
     pub order: Account<'info, Order>,
-    #[account(mut, seeds = [PROFILE_SEED, buyer.key().as_ref()], bump = buyer_profile.bump)]
+    #[account(mut)]
     pub buyer_profile: Account<'info, ReferralProfile>,
-    #[account(mut, seeds = [REWARD_SEED, buyer.key().as_ref()], bump = buyer_reward_vault.bump)]
+    #[account(mut)]
     pub buyer_reward_vault: Account<'info, RewardVault>,
-    #[account(mut, address = config.collection_mint)]
+    #[account(mut)]
     pub collection_mint: Account<'info, Mint>,
-    #[account(
-        mut,
-        constraint = buyer_nft_account.owner == buyer.key(),
-        constraint = buyer_nft_account.mint == collection_mint.key()
-    )]
+    #[account(mut)]
     pub buyer_nft_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-#[instruction(order_id: Vec<u8>)]
+#[instruction(order_seed: Vec<u8>)]
 pub struct MintWithUsdc<'info> {
     #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
-    #[account(mut, address = config.treasury_sol)]
-    /// CHECK: not used but kept for parity
-    pub treasury_sol: AccountInfo<'info>,
+    /// CHECK: validated against config
+    #[account(mut)]
+    pub treasury_sol: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub treasury_usdc: Account<'info, TokenAccount>,
     #[account(mut)]
     pub buyer: Signer<'info>,
-    #[account(
-        init_if_needed,
-        payer = buyer,
-        space = Order::LEN,
-        seeds = [ORDER_SEED, order_id.as_slice()],
-        bump
-    )]
-    pub order: Account<'info, Order>,
-    #[account(mut, seeds = [PROFILE_SEED, buyer.key().as_ref()], bump = buyer_profile.bump)]
-    pub buyer_profile: Account<'info, ReferralProfile>,
-    #[account(mut, seeds = [REWARD_SEED, buyer.key().as_ref()], bump = buyer_reward_vault.bump)]
-    pub buyer_reward_vault: Account<'info, RewardVault>,
-    #[account(mut, address = config.collection_mint)]
-    pub collection_mint: Account<'info, Mint>,
-    #[account(
-        mut,
-        constraint = buyer_nft_account.owner == buyer.key(),
-        constraint = buyer_nft_account.mint == collection_mint.key()
-    )]
-    pub buyer_nft_account: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        constraint = buyer_usdc.owner == buyer.key(),
-        constraint = buyer_usdc.mint == config.usdc_mint
-    )]
+    #[account(mut)]
     pub buyer_usdc: Account<'info, TokenAccount>,
     #[account(
-        mut,
-        address = config.treasury_usdc,
-        constraint = treasury_usdc.mint == config.usdc_mint
+        init,
+        payer = buyer,
+        seeds = [ORDER_SEED, order_seed.as_slice()],
+        bump,
+        space = Order::LEN
     )]
-    pub treasury_usdc: Account<'info, TokenAccount>,
+    pub order: Account<'info, Order>,
+    #[account(mut)]
+    pub buyer_profile: Account<'info, ReferralProfile>,
+    #[account(mut)]
+    pub buyer_reward_vault: Account<'info, RewardVault>,
+    #[account(mut)]
+    pub collection_mint: Account<'info, Mint>,
+    #[account(mut)]
+    pub buyer_nft_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct ClaimSol<'info> {
-    #[account(mut, seeds = [REWARD_SEED, user.key().as_ref()], bump = reward_vault.bump)]
+    #[account(mut, seeds = [REWARD_SEED, reward_vault.user.as_ref()], bump = reward_vault.bump)]
     pub reward_vault: Account<'info, RewardVault>,
     #[account(mut)]
     pub user: Signer<'info>,
@@ -621,122 +590,30 @@ pub struct ClaimSol<'info> {
 
 #[derive(Accounts)]
 pub struct ClaimUsdc<'info> {
-    #[account(mut, seeds = [REWARD_SEED, user.key().as_ref()], bump = reward_vault.bump)]
+    #[account(mut, seeds = [REWARD_SEED, reward_vault.user.as_ref()], bump = reward_vault.bump)]
     pub reward_vault: Account<'info, RewardVault>,
-    #[account(
-        mut,
-        constraint = reward_usdc.owner == reward_vault.key()
-    )]
+    #[account(mut)]
     pub reward_usdc: Account<'info, TokenAccount>,
-    #[account(
-        mut,
-        constraint = user_usdc.owner == user.key(),
-        constraint = user_usdc.mint == reward_usdc.mint
-    )]
+    #[account(mut)]
     pub user_usdc: Account<'info, TokenAccount>,
-    #[account(mut, address = reward_vault.user)]
     pub user: Signer<'info>,
     pub token_program: Program<'info, Token>,
-}
-
-fn validate_referral<'info>(
-    program_id: &Pubkey,
-    collection_mint: &Pubkey,
-    usdc_mint: &Pubkey,
-    referrer: Pubkey,
-    profile_info: AccountInfo<'info>,
-    reward_vault_info: AccountInfo<'info>,
-    reward_usdc_info: AccountInfo<'info>,
-    nft_info: &AccountInfo<'info>,
-) -> Result<(ReferralNode<'info>, Option<Pubkey>)> {
-    let derived_profile =
-        Pubkey::find_program_address(&[PROFILE_SEED, referrer.as_ref()], program_id).0;
-    require_keys_eq!(
-        derived_profile,
-        profile_info.key(),
-        ErrorCode::InvalidReferralAccount
-    );
-
-    let derived_reward =
-        Pubkey::find_program_address(&[REWARD_SEED, referrer.as_ref()], program_id).0;
-    require_keys_eq!(
-        derived_reward,
-        reward_vault_info.key(),
-        ErrorCode::InvalidReferralAccount
-    );
-
-    let expected_nft = get_associated_token_address(&referrer, collection_mint);
-    require_keys_eq!(
-        expected_nft,
-        nft_info.key(),
-        ErrorCode::InvalidReferralAccount
-    );
-
-    let profile = {
-        let data = profile_info.try_borrow_data()?;
-        let mut slice: &[u8] = &data;
-        let account: ReferralProfile = ReferralProfile::try_deserialize(&mut slice)?;
-        require_keys_eq!(account.user, referrer, ErrorCode::InvalidReferralAccount);
-        account
-    };
-
-    let reward_vault = {
-        let data = reward_vault_info.try_borrow_data()?;
-        let mut slice: &[u8] = &data;
-        let account: RewardVault = RewardVault::try_deserialize(&mut slice)?;
-        require_keys_eq!(account.user, referrer, ErrorCode::InvalidReferralAccount);
-        account
-    };
-
-    let _reward_usdc = {
-        let data = reward_usdc_info.try_borrow_data()?;
-        let mut slice: &[u8] = &data;
-        let account: TokenAccount = TokenAccount::try_deserialize(&mut slice)?;
-        require_keys_eq!(
-            account.owner,
-            reward_vault_info.key(),
-            ErrorCode::InvalidReferralAccount
-        );
-        require_keys_eq!(account.mint, *usdc_mint, ErrorCode::InvalidReferralAccount);
-        account
-    };
-
-    let next_referrer = if profile.has_referrer {
-        Some(profile.referrer)
-    } else {
-        None
-    };
-
-    Ok((
-        ReferralNode {
-            reward_vault_info,
-            reward_usdc_info,
-            reward_vault,
-        },
-        next_referrer,
-    ))
-}
-
-struct ReferralNode<'info> {
-    reward_vault_info: AccountInfo<'info>,
-    reward_usdc_info: AccountInfo<'info>,
-    reward_vault: RewardVault,
 }
 
 #[account]
 pub struct Config {
     pub admin: Pubkey,
+    pub usdc_mint: Pubkey,
+    pub collection_mint: Pubkey,
     pub treasury_sol: Pubkey,
     pub treasury_usdc: Pubkey,
-    pub collection_mint: Pubkey,
-    pub usdc_mint: Pubkey,
     pub sol_price: u64,
     pub usdc_price: u64,
     pub bump: u8,
 }
 
 impl Config {
-    pub const LEN: usize = 8 + (32 * 5) + 8 + 8 + 1;
+    pub const LEN: usize = 8 + 32 * 5 + 8 * 2 + 1;
 }
 
 #[account]
@@ -744,11 +621,12 @@ pub struct ReferralProfile {
     pub user: Pubkey,
     pub has_referrer: bool,
     pub referrer: Pubkey,
+    pub minted_nft: bool,
     pub bump: u8,
 }
 
 impl ReferralProfile {
-    pub const LEN: usize = 8 + 32 + 1 + 32 + 1;
+    pub const LEN: usize = 8 + 32 + 1 + 32 + 1 + 1;
 }
 
 #[account]
@@ -765,46 +643,38 @@ impl RewardVault {
 
 #[account]
 pub struct Order {
-    pub seed: [u8; 16],
-    pub buyer: Pubkey,
-    pub used: bool,
+    pub id: [u8; 16],
     pub bump: u8,
 }
 
 impl Order {
-    pub const LEN: usize = 8 + 16 + 32 + 1 + 1;
+    pub const LEN: usize = 8 + 16 + 1;
 }
 
 #[error_code]
-pub enum ErrorCode {
-    #[msg("The provided admin is invalid")]
-    InvalidAdmin,
-    #[msg("The provided price is invalid")]
-    InvalidPrice,
-    #[msg("Referrer already set for this profile")]
+pub enum TrsalesError {
+    #[msg("Invalid treasury account provided")]
+    InvalidTreasury,
+    #[msg("Order seed must be 16 bytes")]
+    InvalidOrderSeed,
+    #[msg("Mathematical overflow")]
+    MathOverflow,
+    #[msg("Unauthorized action")]
+    Unauthorized,
+    #[msg("Referrer already set")]
     ReferrerAlreadySet,
     #[msg("Invalid referrer provided")]
     InvalidReferrer,
-    #[msg("Order identifier is invalid")]
-    InvalidOrderId,
-    #[msg("This order has already been used")]
-    OrderAlreadyUsed,
-    #[msg("Profile mismatch")]
-    ProfileMismatch,
-    #[msg("Math overflow")]
-    MathOverflow,
-    #[msg("Missing referral accounts")]
-    MissingReferralAccounts,
-    #[msg("Too many referral accounts provided")]
-    TooManyReferralAccounts,
-    #[msg("Referral account validation failed")]
-    InvalidReferralAccount,
+    #[msg("Cannot refer yourself")]
+    SelfReferral,
+    #[msg("Collection mint mismatch")]
+    CollectionMismatch,
     #[msg("Nothing to claim")]
     NothingToClaim,
-    #[msg("Insufficient funds in reward vault")]
-    InsufficientVaultFunds,
-    #[msg("Collection mint does not match the provided configuration")]
-    InvalidCollectionMint,
-    #[msg("Treasury account configuration is invalid")]
-    InvalidTreasuryAccount,
+    #[msg("Invalid reward vault provided")]
+    InvalidRewardVault,
+    #[msg("Invalid profile account provided")]
+    InvalidProfileAccount,
+    #[msg("Profile and reward owner mismatch")]
+    ProfileMismatch,
 }
