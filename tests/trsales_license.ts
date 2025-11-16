@@ -1,5 +1,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import { BN, Program } from "@coral-xyz/anchor";
+import { readFileSync } from "fs";
+import path from "path";
 import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -20,7 +22,26 @@ const ORDER_SEED = Buffer.from("order");
 describe("trsales_license", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
-  const program = anchor.workspace.TrsalesLicense as Program<TrsalesLicense>;
+
+  const idlPath = path.resolve(__dirname, "../target/idl/trsales_license.json");
+  const idlJson = JSON.parse(readFileSync(idlPath, "utf-8"));
+  const programId = new PublicKey(
+    idlJson.metadata?.address ?? idlJson.address,
+  );
+
+  const workspace = anchor.workspace as typeof anchor.workspace & {
+    TrsalesLicense: Program<TrsalesLicense>;
+  };
+
+  if (!workspace.TrsalesLicense.programId.equals(programId)) {
+    workspace.TrsalesLicense = new anchor.Program(
+      workspace.TrsalesLicense.idl,
+      programId,
+      provider,
+    ) as Program<TrsalesLicense>;
+  }
+
+  const program = workspace.TrsalesLicense;
 
   const connection = provider.connection;
   const admin = provider.wallet as anchor.Wallet;
