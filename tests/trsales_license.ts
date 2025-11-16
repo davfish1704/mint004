@@ -1,76 +1,125 @@
-import * as anchor from "@coral-xyz/anchor";
-import { BN, Program } from "@coral-xyz/anchor";
-import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import * as anchor from "@project-serum/anchor";
+import { Program } from "@project-serum/anchor";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
   createMint,
-  getAccount,
-  getAssociatedTokenAddressSync,
   mintTo,
+  getAccount,
 } from "@solana/spl-token";
+import {
+  Keypair,
+  SystemProgram,
+  PublicKey,
+  LAMPORTS_PER_SOL,
+} from "@solana/web3.js";
+import { expect } from "chai";
 import { TrsalesLicense } from "../target/types/trsales_license";
+
+const provider = anchor.AnchorProvider.env();
+anchor.setProvider(provider);
+
+const program = anchor.workspace.trsales_license as Program<TrsalesLicense>;
+
+if (!provider || !provider.wallet || !provider.wallet.publicKey) {
+  throw new Error(
+    "Provider wallet or wallet.publicKey is undefined. Make sure AnchorProvider.env() is configured with a wallet.",
+  );
+}
+if (!program) {
+  throw new Error(
+    "Program trsales_license not found in anchor.workspace. Check Anchor.toml and IDL name.",
+  );
+}
+
+const admin = provider.wallet;
+const adminSigner = (admin as anchor.Wallet & { payer: Keypair }).payer;
+const connection = provider.connection;
 
 const CONFIG_SEED = Buffer.from("config");
 const PROFILE_SEED = Buffer.from("profile");
 const REWARD_SEED = Buffer.from("reward");
 const ORDER_SEED = Buffer.from("order");
 
+function getConfigPda(): PublicKey {
+  return PublicKey.findProgramAddressSync([CONFIG_SEED], program.programId)[0];
+}
+
+function getProfilePda(user: PublicKey): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [PROFILE_SEED, user.toBuffer()],
+    program.programId,
+  )[0];
+}
+
+function getRewardVaultPda(user: PublicKey): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [REWARD_SEED, user.toBuffer()],
+    program.programId,
+  )[0];
+}
+
+function getOrderPda(orderIdBytes: Buffer): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [ORDER_SEED, orderIdBytes],
+    program.programId,
+  )[0];
+}
+
+const userA = Keypair.generate();
+const userB = Keypair.generate();
+const userC = Keypair.generate();
+const userD = Keypair.generate();
+const feePayer = Keypair.generate();
+
+const referralUsers = [userB, userC, userD];
+
+const solPrice = new anchor.BN(Math.floor(LAMPORTS_PER_SOL / 10));
+const usdcPrice = new anchor.BN(50_000_000);
+
+const referralBps = [5000, 3000, 2000];
+const basisPoints = 10000;
+
+const userData = new Map<
+  string,
+  { profile: PublicKey; rewardVault: PublicKey; rewardUsdc: PublicKey }
+>();
+
+let configPda: PublicKey;
+let usdcMint: PublicKey;
+let collectionMint: PublicKey;
+let treasurySolKp: Keypair;
+let treasuryUsdcAta: PublicKey;
+
 describe("trsales_license", () => {
-  const provider = anchor.AnchorProvider.env();
-  anchor.setProvider(provider);
-  const program = anchor.workspace.TrsalesLicense as Program<TrsalesLicense>;
+  before(async () => {
+    configPda = getConfigPda();
 
-  const connection = provider.connection;
-  const admin = provider.wallet as anchor.Wallet;
+    await airdrop(feePayer.publicKey, 10 * LAMPORTS_PER_SOL);
+    await Promise.all(
+      [userA, userB, userC, userD].map((kp) =>
+        airdrop(kp.publicKey, 2 * LAMPORTS_PER_SOL),
+      ),
+    );
 
-  const solPrice = new BN(1_000_000_000); // 1 SOL
-  const usdcPrice = new BN(1_000_000); // 1 USDC assuming 6 decimals
-
-  let configPda: PublicKey;
-  let usdcMint: PublicKey;
-  let collectionMint: PublicKey;
-  let treasuryUsdcAta: PublicKey;
-
-  const top = Keypair.generate();
-  const mid = Keypair.generate();
-  const direct = Keypair.generate();
-  const solBuyer = Keypair.generate();
-  const usdcBuyer = Keypair.generate();
-
-  const users = [top, mid, direct, solBuyer, usdcBuyer];
-
-  before("setup program", async () => {
-    configPda = PublicKey.findProgramAddressSync([CONFIG_SEED], program.programId)[0];
+    treasurySolKp = Keypair.generate();
+    await airdrop(treasurySolKp.publicKey, 2 * LAMPORTS_PER_SOL);
 
     usdcMint = await createMint(
       connection,
-      admin.payer,
+      feePayer,
       admin.publicKey,
       null,
       6,
     );
 
-    const treasuryUsdc = getAssociatedTokenAddressSync(usdcMint, admin.publicKey);
-    const treasuryInfo = await connection.getAccountInfo(treasuryUsdc);
-    if (!treasuryInfo) {
-      const ix = createAssociatedTokenAccountInstruction(
-        admin.publicKey,
-        treasuryUsdc,
-        admin.publicKey,
-        usdcMint,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID,
-      );
-      const tx = new anchor.web3.Transaction().add(ix);
-      await provider.sendAndConfirm(tx, []);
-    }
-    treasuryUsdcAta = treasuryUsdc;
+    treasuryUsdcAta = await ensureAta(usdcMint, admin.publicKey, false);
 
     collectionMint = await createMint(
       connection,
-      admin.payer,
+      feePayer,
       configPda,
       configPda,
       0,
@@ -87,280 +136,387 @@ describe("trsales_license", () => {
       .accounts({
         config: configPda,
         payer: admin.publicKey,
-        treasurySol: admin.publicKey,
+        treasurySol: treasurySolKp.publicKey,
         treasuryUsdc: treasuryUsdcAta,
         collectionMint,
         systemProgram: SystemProgram.programId,
       })
       .rpc();
-
-    for (const user of users) {
-      const signature = await connection.requestAirdrop(user.publicKey, 3 * anchor.web3.LAMPORTS_PER_SOL);
-      await connection.confirmTransaction(signature, "confirmed");
-    }
   });
 
-  const getProfilePda = (pk: PublicKey) =>
-    PublicKey.findProgramAddressSync([PROFILE_SEED, pk.toBuffer()], program.programId)[0];
+  it("initializes config", async () => {
+    const config = await program.account.config.fetch(configPda);
+    expect(config.admin.equals(admin.publicKey)).to.be.true;
+    expect(config.usdcMint.equals(usdcMint)).to.be.true;
+    expect(config.collectionMint.equals(collectionMint)).to.be.true;
+    expect(config.treasurySol.equals(treasurySolKp.publicKey)).to.be.true;
+    expect(config.treasuryUsdc.equals(treasuryUsdcAta)).to.be.true;
+    expect(config.solPrice.eq(solPrice)).to.be.true;
+    expect(config.usdcPrice.eq(usdcPrice)).to.be.true;
+  });
 
-  const getRewardVaultPda = (pk: PublicKey) =>
-    PublicKey.findProgramAddressSync([REWARD_SEED, pk.toBuffer()], program.programId)[0];
+  it("registers all users", async () => {
+    for (const user of [userA, userB, userC, userD]) {
+      const profilePda = getProfilePda(user.publicKey);
+      const rewardVault = getRewardVaultPda(user.publicKey);
+      const rewardUsdc = await ensureAta(usdcMint, rewardVault, true);
 
-  const getOrderPda = (id: Buffer) =>
-    PublicKey.findProgramAddressSync([ORDER_SEED, id], program.programId)[0];
+      await program.methods
+        .registerUser()
+        .accounts({
+          config: configPda,
+          payer: user.publicKey,
+          profile: profilePda,
+          rewardVault,
+          usdcMint,
+          rewardUsdc,
+          user: user.publicKey,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        })
+        .signers([user])
+        .rpc();
 
-  async function register(user: Keypair) {
-    const profilePda = getProfilePda(user.publicKey);
-    const rewardVault = getRewardVaultPda(user.publicKey);
-    const rewardUsdc = getAssociatedTokenAddressSync(usdcMint, rewardVault, true);
-
-    await program.methods
-      .registerUser()
-      .accounts({
-        config: configPda,
-        payer: user.publicKey,
+      userData.set(user.publicKey.toBase58(), {
         profile: profilePda,
         rewardVault,
-        usdcMint,
         rewardUsdc,
-        user: user.publicKey,
-        systemProgram: SystemProgram.programId,
-        tokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-      })
-      .signers([user])
-      .rpc();
+      });
 
-    return { profilePda, rewardVault, rewardUsdc };
-  }
+      const profile = await program.account.referralProfile.fetch(profilePda);
+      expect(profile.user.equals(user.publicKey)).to.be.true;
+      expect(profile.hasReferrer).to.be.false;
 
-  async function setReferrer(child: Keypair, parent: PublicKey) {
-    const profilePda = getProfilePda(child.publicKey);
-    const parentPda = getProfilePda(parent);
-    await program.methods
-      .setReferrer(parent)
-      .accounts({
-        profile: profilePda,
-        user: child.publicKey,
-        parentProfile: parentPda,
-      })
-      .signers([child])
-      .rpc();
-  }
-
-  async function createCollectionAta(owner: PublicKey) {
-    const ata = getAssociatedTokenAddressSync(collectionMint, owner);
-    const info = await connection.getAccountInfo(ata);
-    if (!info) {
-      const ix = createAssociatedTokenAccountInstruction(
-        admin.publicKey,
-        ata,
-        owner,
-        collectionMint,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID,
-      );
-      const tx = new anchor.web3.Transaction().add(ix);
-      await provider.sendAndConfirm(tx, []);
+      const rewardVaultAccount = await program.account.rewardVault.fetch(rewardVault);
+      expect(rewardVaultAccount.user.equals(user.publicKey)).to.be.true;
+      expect(rewardVaultAccount.claimableSol.toNumber()).to.equal(0);
+      expect(rewardVaultAccount.claimableUsdc.toNumber()).to.equal(0);
     }
-    return ata;
-  }
+  });
 
-  const orderSeedFor = (label: string) => {
-    const buf = Buffer.alloc(16);
-    buf.write(label);
-    return buf;
-  };
-
-  async function mintSolSale(buyer: Keypair, orderSeed: Buffer, remaining: anchor.web3.AccountMeta[]) {
-    const profilePda = getProfilePda(buyer.publicKey);
-    const rewardVault = getRewardVaultPda(buyer.publicKey);
-    const buyerAta = getAssociatedTokenAddressSync(collectionMint, buyer.publicKey);
-    const orderPda = getOrderPda(orderSeed);
+  it("sets referral chain A → B → C → D", async () => {
+    await program.methods
+      .setReferrer(userB.publicKey)
+      .accounts({
+        profile: userData.get(userA.publicKey.toBase58())!.profile,
+        user: userA.publicKey,
+        parentProfile: userData.get(userB.publicKey.toBase58())!.profile,
+      })
+      .signers([userA])
+      .rpc();
 
     await program.methods
-      .mintWithSol([...orderSeed])
+      .setReferrer(userC.publicKey)
+      .accounts({
+        profile: userData.get(userB.publicKey.toBase58())!.profile,
+        user: userB.publicKey,
+        parentProfile: userData.get(userC.publicKey.toBase58())!.profile,
+      })
+      .signers([userB])
+      .rpc();
+
+    await program.methods
+      .setReferrer(userD.publicKey)
+      .accounts({
+        profile: userData.get(userC.publicKey.toBase58())!.profile,
+        user: userC.publicKey,
+        parentProfile: userData.get(userD.publicKey.toBase58())!.profile,
+      })
+      .signers([userC])
+      .rpc();
+
+    const profileA = await program.account.referralProfile.fetch(
+      userData.get(userA.publicKey.toBase58())!.profile,
+    );
+    const profileB = await program.account.referralProfile.fetch(
+      userData.get(userB.publicKey.toBase58())!.profile,
+    );
+    const profileC = await program.account.referralProfile.fetch(
+      userData.get(userC.publicKey.toBase58())!.profile,
+    );
+    const profileD = await program.account.referralProfile.fetch(
+      userData.get(userD.publicKey.toBase58())!.profile,
+    );
+
+    expect(profileA.referrer.equals(userB.publicKey)).to.be.true;
+    expect(profileA.hasReferrer).to.be.true;
+    expect(profileB.referrer.equals(userC.publicKey)).to.be.true;
+    expect(profileB.hasReferrer).to.be.true;
+    expect(profileC.referrer.equals(userD.publicKey)).to.be.true;
+    expect(profileC.hasReferrer).to.be.true;
+    expect(profileD.hasReferrer).to.be.false;
+  });
+
+  it("mints with SOL and distributes referral rewards", async () => {
+    const orderIdBuffer = Buffer.alloc(16);
+    orderIdBuffer.write("sol-order-0001");
+    const orderPda = getOrderPda(orderIdBuffer);
+    const buyerProfile = userData.get(userA.publicKey.toBase58())!.profile;
+    const buyerRewardVault = userData.get(userA.publicKey.toBase58())!.rewardVault;
+    const buyerNftAccount = await ensureAta(collectionMint, userA.publicKey, false);
+
+    const remainingAccounts = await buildReferralAccounts();
+
+    const beforeVaults = await Promise.all(
+      referralUsers.map((user) =>
+        program.account.rewardVault.fetch(
+          userData.get(user.publicKey.toBase58())!.rewardVault,
+        ),
+      ),
+    );
+    const treasuryBefore = await connection.getBalance(treasurySolKp.publicKey);
+
+    await program.methods
+      .mintWithSol(orderIdBuffer)
       .accounts({
         config: configPda,
-        treasurySol: admin.publicKey,
-        buyer: buyer.publicKey,
+        treasurySol: treasurySolKp.publicKey,
+        buyer: userA.publicKey,
         order: orderPda,
-        buyerProfile: profilePda,
-        buyerRewardVault: rewardVault,
+        buyerProfile,
+        buyerRewardVault,
         collectionMint,
-        buyerNftAccount: buyerAta,
+        buyerNftAccount,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts(remaining)
-      .signers([buyer])
+      .remainingAccounts(remainingAccounts)
+      .signers([userA])
       .rpc();
-  }
 
-  async function mintUsdcSale(buyer: Keypair, orderSeed: Buffer, remaining: anchor.web3.AccountMeta[]) {
-    const profilePda = getProfilePda(buyer.publicKey);
-    const rewardVault = getRewardVaultPda(buyer.publicKey);
-    const buyerAta = getAssociatedTokenAddressSync(collectionMint, buyer.publicKey);
-    const buyerUsdc = getAssociatedTokenAddressSync(usdcMint, buyer.publicKey);
-    const orderPda = getOrderPda(orderSeed);
+    const order = await program.account.order.fetch(orderPda);
+    expect(order.used).to.be.true;
+    expect(order.buyer.equals(userA.publicKey)).to.be.true;
+
+    const afterVaults = await Promise.all(
+      referralUsers.map((user) =>
+        program.account.rewardVault.fetch(
+          userData.get(user.publicKey.toBase58())!.rewardVault,
+        ),
+      ),
+    );
+
+    const shareB = solPrice.muln(referralBps[0]).divn(basisPoints);
+    const shareC = solPrice.muln(referralBps[1]).divn(basisPoints);
+    const shareD = solPrice.muln(referralBps[2]).divn(basisPoints);
+
+    expect(
+      afterVaults[0].claimableSol.sub(beforeVaults[0].claimableSol).eq(shareB),
+    ).to.be.true;
+    expect(
+      afterVaults[1].claimableSol.sub(beforeVaults[1].claimableSol).eq(shareC),
+    ).to.be.true;
+    expect(
+      afterVaults[2].claimableSol.sub(beforeVaults[2].claimableSol).eq(shareD),
+    ).to.be.true;
+
+    for (let i = 0; i < referralUsers.length; i++) {
+      const vaultPubkey = userData.get(referralUsers[i].publicKey.toBase58())!
+        .rewardVault;
+      const lamports = await connection.getBalance(vaultPubkey);
+      expect(lamports).to.be.gte(afterVaults[i].claimableSol.toNumber());
+    }
+
+    const treasuryAfter = await connection.getBalance(treasurySolKp.publicKey);
+    const expectedRemainder = solPrice
+      .sub(shareB.add(shareC).add(shareD))
+      .toNumber();
+    expect(treasuryAfter - treasuryBefore).to.equal(expectedRemainder);
+  });
+
+  it("allows referrers to claim SOL", async () => {
+    for (const user of referralUsers) {
+      const rewardVault = userData.get(user.publicKey.toBase58())!.rewardVault;
+      const rewardBefore = await program.account.rewardVault.fetch(rewardVault);
+      const userBefore = await connection.getBalance(user.publicKey);
+
+      await program.methods
+        .claimSol()
+        .accounts({
+          rewardVault,
+          user: user.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([user])
+        .rpc();
+
+      const rewardAfter = await program.account.rewardVault.fetch(rewardVault);
+      expect(rewardAfter.claimableSol.toNumber()).to.equal(0);
+      const userAfter = await connection.getBalance(user.publicKey);
+      const tolerance = 10_000;
+      expect(userAfter).to.be.gte(
+        userBefore + rewardBefore.claimableSol.toNumber() - tolerance,
+      );
+    }
+  });
+
+  it("mints with USDC and distributes referral rewards", async () => {
+    const orderIdBuffer = Buffer.alloc(16);
+    orderIdBuffer.write("usdc-order-0001");
+    const orderPda = getOrderPda(orderIdBuffer);
+    const buyerProfile = userData.get(userA.publicKey.toBase58())!.profile;
+    const buyerRewardVault = userData.get(userA.publicKey.toBase58())!.rewardVault;
+    const buyerNftAccount = await ensureAta(collectionMint, userA.publicKey, false);
+    const buyerUsdc = await ensureAta(usdcMint, userA.publicKey, false);
+
+    await mintTo(
+      connection,
+      feePayer,
+      usdcMint,
+      buyerUsdc,
+      adminSigner,
+      usdcPrice.muln(2).toNumber(),
+    );
+
+    const remainingAccounts = await buildReferralAccounts();
+
+    const beforeVaults = await Promise.all(
+      referralUsers.map((user) =>
+        program.account.rewardVault.fetch(
+          userData.get(user.publicKey.toBase58())!.rewardVault,
+        ),
+      ),
+    );
+    const beforeRewardBalances = await Promise.all(
+      referralUsers.map((user) =>
+        getTokenBalance(userData.get(user.publicKey.toBase58())!.rewardUsdc),
+      ),
+    );
+    const treasuryBefore = await getTokenBalance(treasuryUsdcAta);
 
     await program.methods
-      .mintWithUsdc([...orderSeed])
+      .mintWithUsdc(orderIdBuffer)
       .accounts({
         config: configPda,
-        treasurySol: admin.publicKey,
-        treasuryUsdc: treasuryUsdcAta,
-        buyer: buyer.publicKey,
+        treasurySol: treasurySolKp.publicKey,
+        buyer: userA.publicKey,
+        order: orderPda,
+        buyerProfile,
+        buyerRewardVault,
+        collectionMint,
+        buyerNftAccount,
         buyerUsdc,
-        order: orderPda,
-        buyerProfile: profilePda,
-        buyerRewardVault: rewardVault,
-        collectionMint,
-        buyerNftAccount: buyerAta,
+        treasuryUsdc: treasuryUsdcAta,
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts(remaining)
-      .signers([buyer])
+      .remainingAccounts(remainingAccounts)
+      .signers([userA])
       .rpc();
-  }
 
-  async function referralRemainingAccounts(start: PublicKey, depth: number) {
-    const accounts: anchor.web3.AccountMeta[] = [];
-    let current: PublicKey | null = start;
-    for (let i = 0; i < depth; i++) {
-      if (!current) break;
-      const profile = getProfilePda(current);
-      const rewardVault = getRewardVaultPda(current);
-      const rewardUsdc = getAssociatedTokenAddressSync(usdcMint, rewardVault, true);
-      const nftAta = getAssociatedTokenAddressSync(collectionMint, current);
-      accounts.push({ pubkey: profile, isSigner: false, isWritable: true });
-      accounts.push({ pubkey: rewardVault, isSigner: false, isWritable: true });
-      accounts.push({ pubkey: rewardUsdc, isSigner: false, isWritable: true });
-      accounts.push({ pubkey: nftAta, isSigner: false, isWritable: false });
-      const profileAccount = await program.account.referralProfile.fetch(profile);
-      current = profileAccount.hasReferrer ? new PublicKey(profileAccount.referrer) : null;
-    }
-    return accounts;
-  }
+    const afterVaults = await Promise.all(
+      referralUsers.map((user) =>
+        program.account.rewardVault.fetch(
+          userData.get(user.publicKey.toBase58())!.rewardVault,
+        ),
+      ),
+    );
+    const afterRewardBalances = await Promise.all(
+      referralUsers.map((user) =>
+        getTokenBalance(userData.get(user.publicKey.toBase58())!.rewardUsdc),
+      ),
+    );
+    const treasuryAfter = await getTokenBalance(treasuryUsdcAta);
 
-  it("registers referral tree and mints NFTs", async () => {
-    await register(top);
-    await register(mid);
-    await register(direct);
-    await register(solBuyer);
-    await register(usdcBuyer);
+    const shareB = usdcPrice.muln(referralBps[0]).divn(basisPoints);
+    const shareC = usdcPrice.muln(referralBps[1]).divn(basisPoints);
+    const shareD = usdcPrice.muln(referralBps[2]).divn(basisPoints);
 
-    await setReferrer(mid, top.publicKey);
-    await setReferrer(direct, mid.publicKey);
-    await setReferrer(solBuyer, direct.publicKey);
-    await setReferrer(usdcBuyer, direct.publicKey);
+    expect(
+      afterVaults[0].claimableUsdc.sub(beforeVaults[0].claimableUsdc).eq(shareB),
+    ).to.be.true;
+    expect(
+      afterVaults[1].claimableUsdc.sub(beforeVaults[1].claimableUsdc).eq(shareC),
+    ).to.be.true;
+    expect(
+      afterVaults[2].claimableUsdc.sub(beforeVaults[2].claimableUsdc).eq(shareD),
+    ).to.be.true;
 
-    for (const user of [top, mid, direct, solBuyer, usdcBuyer]) {
-      await createCollectionAta(user.publicKey);
-    }
+    expect(afterRewardBalances[0].sub(beforeRewardBalances[0]).eq(shareB)).to.be.true;
+    expect(afterRewardBalances[1].sub(beforeRewardBalances[1]).eq(shareC)).to.be.true;
+    expect(afterRewardBalances[2].sub(beforeRewardBalances[2]).eq(shareD)).to.be.true;
 
-    await mintSolSale(top, orderSeedFor("order-top-000001"), []);
-
-    const midRemaining = await referralRemainingAccounts(top.publicKey, 1);
-    await mintSolSale(mid, orderSeedFor("order-mid-000002"), midRemaining);
-
-    const directRemaining = await referralRemainingAccounts(mid.publicKey, 2);
-    await mintSolSale(direct, orderSeedFor("order-dir-000003"), directRemaining);
+    const totalDistributed = shareB.add(shareC).add(shareD);
+    expect(treasuryAfter.sub(treasuryBefore).eq(usdcPrice.sub(totalDistributed))).to.be.true;
   });
 
-  it("distributes SOL referral rewards to three levels", async () => {
-    const remaining = await referralRemainingAccounts(direct.publicKey, 3);
-    const orderSeed = orderSeedFor("order-sol-buy-04");
-    await mintSolSale(solBuyer, orderSeed, remaining);
+  it("allows referrers to claim USDC", async () => {
+    for (const user of referralUsers) {
+      const rewardVault = userData.get(user.publicKey.toBase58())!.rewardVault;
+      const rewardUsdc = userData.get(user.publicKey.toBase58())!.rewardUsdc;
+      const userUsdc = await ensureAta(usdcMint, user.publicKey, false);
+      const rewardBefore = await program.account.rewardVault.fetch(rewardVault);
+      const userBefore = await getTokenBalance(userUsdc);
 
-    const topVault = await program.account.rewardVault.fetch(getRewardVaultPda(top.publicKey));
-    const midVault = await program.account.rewardVault.fetch(getRewardVaultPda(mid.publicKey));
-    const directVault = await program.account.rewardVault.fetch(getRewardVaultPda(direct.publicKey));
+      await program.methods
+        .claimUsdc()
+        .accounts({
+          rewardVault,
+          rewardUsdc,
+          userUsdc,
+          user: user.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([user])
+        .rpc();
 
-    const l1 = solPrice.mul(new BN(50)).div(new BN(100)).toNumber();
-    const l2 = solPrice.mul(new BN(30)).div(new BN(100)).toNumber();
-    const l3 = solPrice.mul(new BN(20)).div(new BN(100)).toNumber();
-
-    anchor.assert.equal(directVault.claimableSol.toNumber(), l1);
-    anchor.assert.equal(midVault.claimableSol.toNumber(), l2);
-    anchor.assert.equal(topVault.claimableSol.toNumber(), l3);
-  });
-
-  it("distributes USDC referral rewards and supports claims", async () => {
-    const buyerUsdcAta = getAssociatedTokenAddressSync(usdcMint, usdcBuyer.publicKey);
-    const info = await connection.getAccountInfo(buyerUsdcAta);
-    if (!info) {
-      const ix = createAssociatedTokenAccountInstruction(
-        admin.publicKey,
-        buyerUsdcAta,
-        usdcBuyer.publicKey,
-        usdcMint,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID,
+      const rewardAfter = await program.account.rewardVault.fetch(rewardVault);
+      expect(rewardAfter.claimableUsdc.toNumber()).to.equal(0);
+      const userAfter = await getTokenBalance(userUsdc);
+      expect(userAfter.sub(userBefore).toNumber()).to.equal(
+        rewardBefore.claimableUsdc.toNumber(),
       );
-      const tx = new anchor.web3.Transaction().add(ix);
-      await provider.sendAndConfirm(tx, []);
     }
-    await mintTo(connection, admin.payer, usdcMint, buyerUsdcAta, admin.publicKey, usdcPrice.toNumber() * 5);
-
-    const remaining = await referralRemainingAccounts(direct.publicKey, 3);
-    const orderSeed = orderSeedFor("order-usdc-005");
-    await mintUsdcSale(usdcBuyer, orderSeed, remaining);
-
-    const topVault = await program.account.rewardVault.fetch(getRewardVaultPda(top.publicKey));
-    const midVault = await program.account.rewardVault.fetch(getRewardVaultPda(mid.publicKey));
-    const directVault = await program.account.rewardVault.fetch(getRewardVaultPda(direct.publicKey));
-
-    const l1 = usdcPrice.mul(new BN(50)).div(new BN(100));
-    const l2 = usdcPrice.mul(new BN(30)).div(new BN(100));
-    const l3 = usdcPrice.mul(new BN(20)).div(new BN(100));
-
-    anchor.assert.equal(directVault.claimableUsdc.toString(), l1.toString());
-    anchor.assert.equal(midVault.claimableUsdc.toString(), l2.toString());
-    anchor.assert.equal(topVault.claimableUsdc.toString(), l3.toString());
-
-    const before = await connection.getBalance(direct.publicKey);
-    await program.methods
-      .claimSol()
-      .accounts({
-        rewardVault: getRewardVaultPda(direct.publicKey),
-        user: direct.publicKey,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([direct])
-      .rpc();
-    const after = await connection.getBalance(direct.publicKey);
-    anchor.assert.ok(after > before);
-
-    const directUsdcAta = getAssociatedTokenAddressSync(usdcMint, direct.publicKey);
-    const directUsdcInfo = await connection.getAccountInfo(directUsdcAta);
-    if (!directUsdcInfo) {
-      const ix = createAssociatedTokenAccountInstruction(
-        admin.publicKey,
-        directUsdcAta,
-        direct.publicKey,
-        usdcMint,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID,
-      );
-      const tx = new anchor.web3.Transaction().add(ix);
-      await provider.sendAndConfirm(tx, []);
-    }
-    const beforeUsdc = BigInt((await getAccount(connection, directUsdcAta)).amount.toString());
-    await program.methods
-      .claimUsdc()
-      .accounts({
-        rewardVault: getRewardVaultPda(direct.publicKey),
-        rewardUsdc: getAssociatedTokenAddressSync(usdcMint, getRewardVaultPda(direct.publicKey), true),
-        userUsdc: directUsdcAta,
-        user: direct.publicKey,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .signers([direct])
-      .rpc();
-    const afterUsdc = BigInt((await getAccount(connection, directUsdcAta)).amount.toString());
-    anchor.assert.ok(afterUsdc > beforeUsdc);
   });
 });
+
+async function airdrop(pubkey: PublicKey, amount: number) {
+  const sig = await connection.requestAirdrop(pubkey, amount);
+  await connection.confirmTransaction(sig, "confirmed");
+}
+
+async function ensureAta(
+  mint: PublicKey,
+  owner: PublicKey,
+  allowOwnerOffCurve: boolean,
+): Promise<PublicKey> {
+  const ata = getAssociatedTokenAddressSync(mint, owner, allowOwnerOffCurve);
+  const info = await connection.getAccountInfo(ata);
+  if (!info) {
+    const ix = createAssociatedTokenAccountInstruction(
+      feePayer.publicKey,
+      ata,
+      owner,
+      mint,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID,
+    );
+    const tx = new anchor.web3.Transaction().add(ix);
+    await provider.sendAndConfirm(tx, [feePayer]);
+  }
+  return ata;
+}
+
+async function buildReferralAccounts() {
+  const accounts: { pubkey: PublicKey; isWritable: boolean; isSigner: boolean }[] = [];
+  for (const user of referralUsers) {
+    const profile = userData.get(user.publicKey.toBase58())!.profile;
+    const rewardVault = userData.get(user.publicKey.toBase58())!.rewardVault;
+    const rewardUsdc = userData.get(user.publicKey.toBase58())!.rewardUsdc;
+    const nft = await ensureAta(collectionMint, user.publicKey, false);
+    accounts.push(
+      { pubkey: profile, isWritable: false, isSigner: false },
+      { pubkey: rewardVault, isWritable: true, isSigner: false },
+      { pubkey: rewardUsdc, isWritable: false, isSigner: false },
+      { pubkey: nft, isWritable: false, isSigner: false },
+    );
+  }
+  return accounts;
+}
+
+async function getTokenBalance(ata: PublicKey) {
+  const account = await getAccount(connection, ata);
+  return new anchor.BN(account.amount.toString());
+}
